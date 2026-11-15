@@ -62,7 +62,7 @@ services:
       -master.volumeSizeLimitMB=1024
     ports:
       - "9000:9000"
-      - "9090:8888"
+      - "9095:8888"
     environment:
       # Admin credentials. SeaweedFS reads these when no -s3.config file is given.
       AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-admin}
@@ -258,10 +258,16 @@ services:
       context: ./Tools
       dockerfile: video/Dockerfile
     restart: on-failure
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2.5G
     environment:
       VIDEO_PREVIEW_SECONDS: 3
       WHISPER_MODEL: small
-      WHISPER_CACHE_DIR: /models/whisper
+      WHISPER_CACHE_DIR: /opt/whisper_models
       WHISPER_CPU_THREADS: 2
     networks:
       - elk
@@ -270,7 +276,6 @@ services:
         condition: service_healthy
     volumes:
       - image_data:/app/images
-      - whisper_models:/models/whisper
 
   border_tool:
     build:
