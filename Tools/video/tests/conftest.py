@@ -5,7 +5,9 @@ import sys
 import pytest
 
 # allows "import effects" / "import video_processor" as in the container
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+video_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, video_dir)
+sys.path.insert(0, os.path.abspath(os.path.join(video_dir, "..")))
 
 
 def make_video(path, seconds=4, size="320x240", fps=25, audio=True, vcodec="libx264"):
