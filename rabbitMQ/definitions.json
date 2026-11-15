@@ -171,6 +171,16 @@
             "vhost": "/",
             "durable": true,
             "auto_delete": false,
+            "arguments": {
+                "x-dead-letter-exchange": "picturas.dlx",
+                "x-dead-letter-routing-key": "video_dlq"
+            }
+        },
+        {
+            "name": "video_dlq",
+            "vhost": "/",
+            "durable": true,
+            "auto_delete": false,
             "arguments": {}
         }
     ],
@@ -183,7 +193,17 @@
             "auto_delete": false,
             "internal": false,
             "arguments": {}
+        },
+        {
+            "name": "picturas.dlx",
+            "vhost": "/",
+            "type": "direct",
+            "durable": true,
+            "auto_delete": false,
+            "internal": false,
+            "arguments": {}
         }
+
     ],
     "bindings": [
         {
@@ -344,6 +364,14 @@
             "destination": "video_queue",
             "destination_type": "queue",
             "routing_key": "video_queue",
+            "arguments": {}
+        },
+        {
+            "source": "picturas.dlx",
+            "vhost": "/",
+            "destination": "video_dlq",
+            "destination_type": "queue",
+            "routing_key": "video_dlq",
             "arguments": {}
         }
     ]

@@ -12,4 +12,7 @@ COPY ./utils ./utils
 RUN pip install --no-cache-dir -r ./utils/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download Whisper model during build to avoid runtime latency spikes
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='/opt/whisper_models')"
+
 CMD [ "python", "-u", "video.py" ]

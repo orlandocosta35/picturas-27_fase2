@@ -5,8 +5,8 @@ processes it with video_processor and replies to the projects orchestrator on
 project_queue. Progress is sent straight to the WebSocket gateway (ws_queue),
 as a percentage.
 
-Unlike the image tools, the message is only acknowledged after the job ends:
-if the worker dies midway, RabbitMQ redelivers it.
+Supports competing consumers (multiple replicas) and Dead Letter Queue (DLQ)
+routing when a job crashes repeatedly or exceeds maximum delivery attempts.
 """
 import datetime
 import json
@@ -23,10 +23,13 @@ from effects import UnsupportedEffect
 from video_processor import InvalidSpeed, InvalidTrim, InvalidVideo, process_video
 
 EXCHANGE = "picturas"
+DLX_EXCHANGE = "picturas.dlx"
 VIDEO_QUEUE = "video_queue"
+VIDEO_DLQ = "video_dlq"
 PROJECT_QUEUE = "project_queue"
 WS_QUEUE = "ws_queue"
 MICROSERVICE = "picturas-video-tool-ms"
+MAX_REDELIVERIES = 1  # 1 initial attempt + 1 retry = 2 total attempts before DLQ
 
 CODES = {
     "wrong_procedure": 2000,
@@ -35,6 +38,7 @@ CODES = {
     "invalid_trim": 2003,
     "invalid_video": 2004,
     "invalid_speed": 2005,
+    "max_retries_exceeded": 2006,
 }
 
 
@@ -48,7 +52,19 @@ class VideoWorker:
         self._channel = self._connection.channel()
         self._channel.exchange_declare(exchange=EXCHANGE,
                                        exchange_type=ExchangeType.direct, durable=True)
-        self._channel.queue_declare(queue=VIDEO_QUEUE, durable=True)
+        self._channel.exchange_declare(exchange=DLX_EXCHANGE,
+                                       exchange_type=ExchangeType.direct, durable=True)
+        self._channel.queue_declare(queue=VIDEO_DLQ, durable=True)
+        self._channel.queue_bind(queue=VIDEO_DLQ, exchange=DLX_EXCHANGE, routing_key=VIDEO_DLQ)
+
+        self._channel.queue_declare(
+            queue=VIDEO_QUEUE,
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": DLX_EXCHANGE,
+                "x-dead-letter-routing-key": VIDEO_DLQ,
+            },
+        )
         self._channel.queue_bind(queue=VIDEO_QUEUE, exchange=EXCHANGE, routing_key=VIDEO_QUEUE)
         # one video at a time per replica; parallelism comes from replicas
         self._channel.basic_qos(prefetch_count=1)
@@ -136,43 +152,58 @@ class VideoWorker:
             preview = bool(params.get("preview"))
             progress = params.get("progress") or {}
         except (ValueError, KeyError) as e:
-            print(f"[video] invalid message discarded: {e}", flush=True)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+            print(f"[video] invalid message routed to DLQ: {e}", flush=True)
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        print(f"[video] msg={msg_id} preview={preview} tools={[t.get('procedure') for t in tools]}",
-              flush=True)
+        # Check if message was already redelivered after a worker crash/OOM
+        is_redelivered = bool(getattr(method, "redelivered", False))
+        print(f"[video] msg={msg_id} redelivered={is_redelivered} preview={preview} "
+              f"tools={[t.get('procedure') for t in tools]}", flush=True)
 
         if info.get("procedure") != "video":
             self._reply_error(msg_id, started, CODES["wrong_procedure"],
                               "The procedure received does not fit into this tool", input_uri)
-        else:
-            try:
-                result = process_video(
-                    input_uri, output_uri, tools, preview=preview,
-                    progress_cb=lambda pct: self._progress(progress, preview, pct),
-                )
-                self._reply_success(msg_id, started, output_uri, result)
-                print(f"[video] msg={msg_id} ok frames={result['frames']} "
-                      f"t={(now() - started).total_seconds():.1f}s", flush=True)
-            except UnsupportedEffect as e:
-                self._reply_error(msg_id, started, CODES["unsupported_effect"], str(e), input_uri)
-            except InvalidTrim as e:
-                self._reply_error(msg_id, started, CODES["invalid_trim"], str(e), input_uri)
-            except InvalidSpeed as e:
-                self._reply_error(msg_id, started, CODES["invalid_speed"], str(e), input_uri)
-            except InvalidVideo as e:
-                self._reply_error(msg_id, started, CODES["invalid_video"], str(e), input_uri)
-            except Exception as e:  # noqa: BLE001 - any other failure is reported
-                self._reply_error(msg_id, started, CODES["error_processing"], str(e), input_uri)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
 
-        # manual ack only at the end
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        try:
+            result = process_video(
+                input_uri, output_uri, tools, preview=preview,
+                progress_cb=lambda pct: self._progress(progress, preview, pct),
+            )
+            self._reply_success(msg_id, started, output_uri, result)
+            print(f"[video] msg={msg_id} ok frames={result['frames']} "
+                  f"t={(now() - started).total_seconds():.1f}s", flush=True)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except (UnsupportedEffect, InvalidTrim, InvalidSpeed, InvalidVideo) as e:
+            # Deterministic domain errors: report to user and acknowledge
+            code_map = {
+                UnsupportedEffect: CODES["unsupported_effect"],
+                InvalidTrim: CODES["invalid_trim"],
+                InvalidSpeed: CODES["invalid_speed"],
+                InvalidVideo: CODES["invalid_video"],
+            }
+            self._reply_error(msg_id, started, code_map[type(e)], str(e), input_uri)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:  # noqa: BLE001
+            print(f"[video] msg={msg_id} error (redelivered={is_redelivered}): {e}", flush=True)
+            if is_redelivered:
+                # Already retried once: isolate in DLQ and notify orchestrator/UI
+                self._reply_error(
+                    msg_id, started, CODES["max_retries_exceeded"],
+                    f"Video processing failed after retry and was moved to DLQ: {e}",
+                    input_uri,
+                )
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            else:
+                # First unexpected failure: requeue once for another healthy replica
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     def run(self):
         self._channel.basic_consume(queue=VIDEO_QUEUE, on_message_callback=self.callback,
                                     auto_ack=False)
-        print("[video] waiting for jobs on video_queue", flush=True)
+        print("[video] waiting for jobs on video_queue (DLQ enabled)", flush=True)
         self._channel.start_consuming()
 
 
