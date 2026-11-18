@@ -414,6 +414,11 @@ useEffect(() => {
     }
 
     console.error("process-error", payload);
+    // Terminal failures invalidate the run and advance the server version.
+    qc.invalidateQueries({
+      queryKey: ["project", session.user._id, pid, session.token, ownerId, shareId],
+      refetchType: "all",
+    });
     setProcessing(false);
     setProcessingProgress(0);
     setProcessingSteps(1);

@@ -151,14 +151,22 @@ exchange:
 > (`prcsousa/picturas-watermark-tool-ms`) instead of being built from this repository — it is a
 > deliberate example of integrating a third-party service.
 
-**Videos** are handled by a single worker, `video_tool` (`Tools/video/`), instead of the image
-tools. For each video, `projects` sends **one** message with the whole pipeline to
-`video_queue`; the worker probes the file with `ffprobe`, decodes it once, applies the frame
+**Videos** are handled by three replicas of `video_tool` (`Tools/video/`), instead of the image
+tools. For each video, `projects` publishes **one** persistent message with the whole pipeline
+using the `video_queue` routing key; the versioned quorum queue `video_queue_v2` distributes
+work among replicas. Each worker probes the file with `ffprobe`, decodes it once, applies the frame
 effects (`Tools/video/effects.py`, the same PIL operations as the image tools), encodes once to
 MP4/H.264 + AAC and reports progress as `video-progress` events on `ws_queue`. It acknowledges
-the message only at the end and leaves no partial output on failure. `ffmpeg` is installed only
-inside this container. Automatic subtitles and frame extraction run as ordered stages of the
+the message after confirmed result publication and leaves no partial output on handled failure.
+Unexpected failures are retried once; the broker also bounds re-deliveries after worker crashes.
+Exhausted jobs remain in `video_dlq`, while a separate failure-event queue notifies the
+orchestrator. Delivery is at least once, so repeated replies are handled without ordinary duplicate
+results; publication and MongoDB updates are not a single transaction. `ffmpeg` is installed
+inside the worker image. Automatic subtitles and frame extraction run as ordered stages of the
 same worker (`Tools/video/subtitles.py`, `Tools/video/frame_extraction.py`).
+
+See [video reliability and parallelism](docs/video-reliability.md) for migration, failure tests,
+and the evidence to collect for REQ-VID-EDIT-011 and REQ-VID-FAIL-004.
 
 ### Infrastructure
 
@@ -374,8 +382,9 @@ All configuration currently lives as `environment:` entries in `docker-compose.y
 | `VIDEO_FREE_MAX_DURATION_S` / `_MAX_SIZE_MB`  | `60` / `100`                  | projects               | Video upload limits for free accounts        |
 | `VIDEO_PREMIUM_MAX_DURATION_S` / `_SIZE_MB`   | `600` / `1024`                | projects               | Video upload limits for premium accounts     |
 | `VIDEO_PREVIEW_SECONDS`                       | `3`                           | video_tool             | Length of a video preview render             |
+| `VIDEO_WORKER_REPLICAS`                       | `3`                           | Compose                | Number of competing video workers            |
 | `WHISPER_MODEL`                               | `small`                       | video_tool             | Faster-Whisper model for automatic subtitles |
-| `WHISPER_CACHE_DIR`                           | `/models/whisper`             | video_tool             | Model cache (the `whisper_models` volume)    |
+| `WHISPER_CACHE_DIR`                           | `/opt/whisper_models`         | video_tool             | Model cache preloaded in the worker image    |
 | `WHISPER_CPU_THREADS`                         | `2`                           | video_tool             | CPU threads for speech recognition           |
 
 ⚠️ If you change `JWT_SECRET_KEY`, change it in **all three** services (`users`, `api_gateway`,
@@ -384,12 +393,15 @@ All configuration currently lives as `environment:` entries in `docker-compose.y
 ### Persistent data
 
 Named Docker volumes: `user_data`, `project_data`, `subscription_data`, `image_data`,
-`seaweedfs_data`, `rabbitmq_data`, `whisper_models` (speech model weights). Database dumps are
+`seaweedfs_data`, `rabbitmq_data`. Whisper weights are preloaded in the worker image; the old
+`whisper_models` volume may remain on upgraded installations but is no longer mounted. Database dumps are
 written to the host at `./backups/mongo` (git-ignored). `docker compose down -v` deletes every volume — the dumps survive.
 
 ### Scaling
 
-- Run more instances of a busy tool: `docker compose up -d --scale brightness_tool=3`
+- Video processing starts with three replicas, each limited to 2 CPUs and 2.5 GB RAM.
+- Set a different video count: `docker compose up -d --scale video_tool=2 video_tool`.
+- Run more instances of another busy tool: `docker compose up -d --scale brightness_tool=3`
 - Watch queue depth in the RabbitMQ management UI (<http://localhost:15672>)
 - Tune per-container CPU/memory limits in `docker-compose.yaml` to match your machine
 
@@ -448,12 +460,12 @@ without detected speech are left unchanged by this step, and original uploads ar
 overwritten.
 
 - Recognition runs locally with [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper)
-  `small` on CPU/int8 — no external API or key. The first use downloads the model weights into
-  the `whisper_models` volume; later runs reuse them.
+  `small` on CPU/int8 — no external API or key. The worker build downloads model weights into
+  `/opt/whisper_models`; each replica uses the weights already present in its image.
 - Order matters: tools placed after subtitles also change the captioned video, so put subtitles
   after `trim`/`speed` and other edits.
-- Preview shows the first 3 s of the final timeline. Subtitle previews may take up to ten
-  minutes on first use (model download, queued CPU work).
+- Preview shows the first 3 s of the final timeline. Subtitle previews can still wait for queued
+  CPU work and model initialization, even though the model is downloaded during the build.
 - Transcription can contain errors. Captions are not editable and there is no SRT export.
 - Configured with `WHISPER_MODEL`, `WHISPER_CACHE_DIR` and `WHISPER_CPU_THREADS` (see
   [Configuration](#-configuration)). The worker image ships Noto fonts for multilingual captions.
@@ -536,6 +548,8 @@ Without ffmpeg on the host, run them in the already-built worker image instead:
 `docker compose run --rm video_tool sh -c "pip install -q pytest && python -m pytest -q tests"`.
 
 The media tests use real FFmpeg; speech recognition is simulated, so no model is downloaded.
+Broker integration tests are opt-in and use an isolated topology; see
+[the verification procedure](docs/video-reliability.md#automated-verification).
 The orchestration tests for the video pipeline and frame extraction run inside `projects`:
 
 ```bash
@@ -602,8 +616,11 @@ is a valid MP4, MOV or WebM. Videos must go to `POST /:user/:project/video`; the
 endpoint rejects them.
 
 **A video stays at 0% or never finishes**
-There is a single `video_tool` with no replicas, so videos are processed one at a time. Check
-`docker compose logs -f video_tool` and the depth of `video_queue` in RabbitMQ.
+Check `docker compose ps video_tool`, `docker compose logs -f video_tool`, and the depths of
+`video_queue_v2`, `video_failed_events`, and `video_dlq` in RabbitMQ. The default configuration
+has three replicas; each processes one video at a time. After an upgrade, follow the
+[queue migration procedure](docs/video-reliability.md#upgrading-an-existing-installation) before
+starting producers and workers.
 
 **`expand_ai` fails**
 It depends on `generative-mock` being healthy. Check <http://localhost:7860> and

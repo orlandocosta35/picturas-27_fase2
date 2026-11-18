@@ -167,14 +167,25 @@
             "arguments": {}
         },
         {
-            "name": "video_queue",
+            "name": "video_queue_v2",
             "vhost": "/",
             "durable": true,
             "auto_delete": false,
             "arguments": {
+                "x-queue-type": "quorum",
+                "x-delivery-limit": 1,
+                "x-dead-letter-strategy": "at-least-once",
+                "x-overflow": "reject-publish",
                 "x-dead-letter-exchange": "picturas.dlx",
                 "x-dead-letter-routing-key": "video_dlq"
             }
+        },
+        {
+            "name": "video_failed_events",
+            "vhost": "/",
+            "durable": true,
+            "auto_delete": false,
+            "arguments": {}
         },
         {
             "name": "video_dlq",
@@ -361,9 +372,17 @@
         {
             "source": "picturas",
             "vhost": "/",
-            "destination": "video_queue",
+            "destination": "video_queue_v2",
             "destination_type": "queue",
             "routing_key": "video_queue",
+            "arguments": {}
+        },
+        {
+            "source": "picturas.dlx",
+            "vhost": "/",
+            "destination": "video_failed_events",
+            "destination_type": "queue",
+            "routing_key": "video_dlq",
             "arguments": {}
         },
         {

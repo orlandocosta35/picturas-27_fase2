@@ -46,3 +46,9 @@ module.exports.deleteByToken = async (user_id, project_id, token) => {
 module.exports.deleteById = (user_id, project_id, id) => {
   return Result.deleteOne({ user_id, project_id, _id: id }).exec();
 };
+
+// Video replies can be redelivered after a broker or orchestrator restart.
+module.exports.createForJob = (output, messageId) => {
+  const { saveJobOutput } = require("../utils/jobOutput");
+  return saveJobOutput(Result, output, messageId);
+};

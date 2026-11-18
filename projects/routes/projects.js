@@ -67,7 +67,7 @@ const {
   insertPipelineTool,
 } = require("../utils/video");
 const { persistFrameResults } = require("../utils/frameResults");
-const { dispatchProcessBatch } = require("../utils/processBatch");
+const { dispatchProcessBatch, completeProcessSource, failProcessSource, abortDispatchedRun, resumeCommittedSource } = require("../utils/processBatch");
 
 const storage = multer.memoryStorage();
 var upload = multer({ storage: storage });
@@ -172,19 +172,16 @@ function process_msg() {
     const timestamp = new Date().toISOString();
     const user_msg_id = `update-client-process-${uuidv4()}`;
 
-    // variáveis “seguras” para usar no catch
-    let runnerIdSafe = null;
-    let ownerIdSafe = null;
+    let msg_content;
+    try { msg_content = JSON.parse(msg.content.toString()); }
+    catch (_) { console.error("[process_msg] discarded malformed reply"); return; }
+    if (!msg_content || typeof msg_content.correlationId !== "string") return;
 
     try {
-      const msg_content = JSON.parse(msg.content.toString());
       const msg_id = msg_content.correlationId;
 
       const process = await Process.getOneByMsgId(msg_id);
       if (!process) return;
-
-      ownerIdSafe = process.user_id;
-      runnerIdSafe = process.runner_id || process.user_id;
 
        console.log(
         `[T-03][RABBIT] msg=${msg_id} status=${msg_content.status} outType=${msg_content?.output?.type} curPos=${process.cur_pos} key=${(process.cache_key||"").slice(0,8)}`
@@ -201,31 +198,33 @@ function process_msg() {
       const img_id = process.img_id;
       
       const project = await Project.getOne(process.user_id, process.project_id);
+      if (!project) {
+        await Process.delete(process.user_id, process.project_id, process._id);
+        return;
+      }
       const sourceIsVideo = project.imgs.some((img) => String(img._id) === String(img_id) && isVideoMedia(img));
-      // In extraction runs keep every source job visible until its output is
-      // persisted, including ordinary images in mixed projects. Failed jobs stay
-      // as barriers so another source cannot commit a partial run.
-      const holdsRunCommit = project.tools.some((tool) => tool.procedure === "extract_frames") && !/preview/.test(msg_id);
+      // Keep video jobs visible until output persistence succeeds, so duplicate
+      // deliveries can safely resume it. Extraction runs retain all source jobs
+      // as commit barriers, including ordinary images in mixed projects.
+      const holdsRunCommit = sourceIsVideo || (project.tools.some((tool) => tool.procedure === "extract_frames") && !/preview/.test(msg_id));
       if (!holdsRunCommit) await Process.delete(process.user_id, process.project_id, process._id);
       
       if (msg_content.status === "error") {
-        console.log(JSON.stringify(msg_content));
-        if (/preview/.test(msg_id)) {
-          send_msg_client_preview_error(`update-client-preview-${uuidv4()}`, timestamp, runnerId, msg_content.error.code, msg_content.error.msg)
-        }
-        
-        else {
-          send_msg_client_error(
-            user_msg_id,
-            timestamp,
-            runnerId,   
-            msg_content.error.code,
-            msg_content.error.msg
-          );
-        }
+        const preview = /preview/.test(msg_id);
+        await failProcessSource({
+          preview,
+          token: process.token || 0,
+          invalidate: () => Project.failRunIfActive(process.user_id, process.project_id, process.token || 0),
+          getProject: () => Project.getOne(process.user_id, process.project_id),
+          notify: () => preview
+            ? send_msg_client_preview_error(`update-client-preview-${uuidv4()}`, timestamp, runnerId, msg_content.error.code, msg_content.error.msg)
+            : send_msg_client_error(user_msg_id, timestamp, runnerId, msg_content.error.code, msg_content.error.msg),
+          remove: () => Process.delete(process.user_id, process.project_id, process._id),
+          removeRun: () => Process.deleteByToken(process.user_id, process.project_id, process.token || 0),
+        });
         return;
       }
-      
+
       const output_file_uri = msg_content.output.imageURI;
       const type = msg_content.output.type;
 
@@ -242,6 +241,12 @@ function process_msg() {
         if (holdsRunCommit) await Process.delete(process.user_id, process.project_id, process._id);
         return;
       }
+
+      if (await resumeCommittedSource({
+        committed: holdsRunCommit && !/preview/.test(msg_id) && project.committedToken === tok,
+        notify: () => send_msg_client(user_msg_id, timestamp, runnerId),
+        remove: () => Process.delete(process.user_id, process.project_id, process._id),
+      })) return;
 
       const next_pos = process.cur_pos + 1;
 
@@ -281,7 +286,8 @@ if (/preview/.test(msg_id) && isLast) {
     user_id: process.user_id,
   };
 
-  await Preview.create(preview);
+  if (sourceIsVideo) await Preview.createForJob(preview, msg_id);
+  else await Preview.create(preview);
 
   // considerar "preview final" quando:
   // - a tool devolveu texto (tipicamente o fim), ou quando
@@ -361,7 +367,7 @@ if (/preview/.test(msg_id) && isLast) {
     }
 
     // envia preview ao cliente
-    send_msg_client_preview(
+    await send_msg_client_preview(
       `update-client-preview-${uuidv4()}`,
       timestamp,
       runnerId,
@@ -370,7 +376,10 @@ if (/preview/.test(msg_id) && isLast) {
   }
 }
 
-      if (/preview/.test(msg_id) && chainEnd) return;
+      if (/preview/.test(msg_id) && chainEnd) {
+        if (holdsRunCommit) await Process.delete(process.user_id, process.project_id, process._id);
+        return;
+      }
 
       if (!/preview/.test(msg_id) && isLast && type === "frames") {
         if (!holdsRunCommit || !sourceIsVideo) throw new Error("Unexpected extracted frames for this job");
@@ -381,7 +390,7 @@ if (/preview/.test(msg_id) && isLast) {
             const response = await post_image(process.user_id, process.project_id, "out", data);
             return response.data.data.imageKey.split("/").pop();
           },
-          create: (result) => Result.create(result),
+          create: (result) => Result.createForJob(result, msg_id),
           removeResult: (id) => Result.deleteById(process.user_id, process.project_id, id),
           removeImage: (key) => delete_image(process.user_id, process.project_id, "out", key),
         });
@@ -418,68 +427,38 @@ if (/preview/.test(msg_id) && isLast) {
           token: process.token || 0, 
         };
 
-        await Result.create(result);
+        if (holdsRunCommit) await Result.createForJob(result, msg_id);
+        else await Result.create(result);
       }
 
-      // Se esta imagem acabou o pipeline, pode ser que a execução tenha terminado
-      if (!/preview/.test(msg_id) && isLast) {
-
-        if (holdsRunCommit && chainEnd) await Process.delete(process.user_id, process.project_id, process._id);
-        // A terminal source has all outputs stored; intermediate text results
-        // retain their barrier until their successor is registered below.
-        const remaining = await Process.countByProjectAndToken(
-          process.project_id,
-          process.token || 0
-        );
-
-        if (remaining === 0) {
-          // re-fetch do projeto (já tens project) mas garante que está fresh
-          const freshProject = await Project.getOne(process.user_id, process.project_id);
-
-          // só commita se ainda for a execução ativa (não foi cancelada entretanto)
-          if ((freshProject.activeToken || 0) === (process.token || 0)) {
-            freshProject.committedToken = process.token || 0;
-
-            //  guardar também resultsToken se ainda uso noutros sítios
-            freshProject.resultsToken = freshProject.committedToken;
-
-            const toolsSnapshot = [...(freshProject.tools || [])]
-              .sort((a,b) => (a.position ?? 0) - (b.position ?? 0))
-              .map(t => ({
-                _id: t._id,
-                position: t.position,
-                procedure: t.procedure,
-                params: t.params,
-              }));
-
-            const committed = await Project.commitRunIfActive(
-              process.user_id, process.project_id, process.token || 0, toolsSnapshot
-            );
-            if (!committed) return;
-
-            console.log(`[COMMIT] project=${process.project_id} committedToken=${process.token || 0}`);
-
-          } else {
-            console.log(
-              `[COMMIT-SKIP] project=${process.project_id} token=${process.token} activeToken=${freshProject.activeToken}`
-            );
-            return;
-          }
+      const notifyProgress = async () => {
+        if (holdsRunCommit) {
+          const latest = await Project.getOne(process.user_id, process.project_id);
+          if (!latest || (latest.activeToken || 0) !== (process.token || 0)) return false;
         }
-      }
+        await send_msg_client(user_msg_id, timestamp, runnerId);
+        return true;
+      };
 
-      if (holdsRunCommit) {
-        const latest = await Project.getOne(process.user_id, process.project_id);
-        if (!latest || (latest.activeToken || 0) !== (process.token || 0)) return;
+      if (!/preview/.test(msg_id) && isLast) {
+        const completed = await completeProcessSource({
+          retained: holdsRunCommit && chainEnd,
+          countPending: () => Process.countByProjectAndToken(process.project_id, process.token || 0),
+          commit: async () => {
+            const fresh = await Project.getOne(process.user_id, process.project_id);
+            if (!fresh || (fresh.activeToken || 0) !== (process.token || 0)) return null;
+            const tools = [...(fresh.tools || [])]
+              .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+              .map(({ _id, position, procedure, params }) => ({ _id, position, procedure, params }));
+            return Project.commitRunIfActive(process.user_id, process.project_id, process.token || 0, tools);
+          },
+          notify: notifyProgress,
+          remove: () => Process.delete(process.user_id, process.project_id, process._id),
+        });
+        if (!completed) return;
+      } else if (!/preview/.test(msg_id)) {
+        if (!await notifyProgress()) return;
       }
-
-      // Notify only after the result is stored and the completed run is committed.
-      if (!/preview/.test(msg_id))
-        send_msg_client(
-          user_msg_id,
-          timestamp,
-          runnerId
-        );
 
       if (chainEnd) return;
 
@@ -526,16 +505,9 @@ if (/preview/.test(msg_id) && isLast) {
 
       console.error("[process_msg] error:", err);
 
-      const target = runnerIdSafe || ownerIdSafe;
-
-      send_msg_client_error(
-        user_msg_id,
-        timestamp,
-        target,
-        "30000",
-        "An error happened while processing the project"
-      );
-      return;
+      // Keep the delivery unacknowledged when persistence is unavailable.
+      // A retry uses the same deterministic video output IDs.
+      throw err;
     }
   });
 }
@@ -1671,6 +1643,12 @@ router.post("/:user/:project/process", checkSharePermission, requireEditPermissi
             send: (job) => send_msg_tool(job.msg_id, job.timestamp, job.og_img_uri, job.new_img_uri, job.tool_name, job.params),
           });
         } catch (error) {
+          await abortDispatchedRun({
+            token: runToken,
+            invalidate: () => Project.failRunIfActive(ownerId, req.params.project, runToken),
+            getProject: () => Project.getOne(ownerId, req.params.project),
+            removeRun: () => Process.deleteByToken(ownerId, req.params.project, runToken),
+          });
           return res.status(603).jsonp("Could not start all processing requests. Please try again.");
         }
         res.sendStatus(201);

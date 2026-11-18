@@ -98,3 +98,12 @@ module.exports.commitRunIfActive = async (user_id, project_id, token, tools) => 
     { new: true }
   ).exec();
 };
+
+// Invalidate only the failed active run. Previous committed results remain visible.
+module.exports.failRunIfActive = async (user_id, project_id, token) => {
+  return Project.findOneAndUpdate(
+    { user_id, _id: project_id, activeToken: token, committedToken: { $ne: token } },
+    { $inc: { activeToken: 1, version: 1 }, $set: { failedToken: token } },
+    { new: true }
+  ).exec();
+};

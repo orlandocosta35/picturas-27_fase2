@@ -32,3 +32,9 @@ module.exports.delete = (user_id, project_id, img_id) => {
     img_id: img_id,
   });
 };
+
+// Video replies can be redelivered after a broker or orchestrator restart.
+module.exports.createForJob = (output, messageId) => {
+  const { saveJobOutput } = require("../utils/jobOutput");
+  return saveJobOutput(Preview, output, messageId);
+};

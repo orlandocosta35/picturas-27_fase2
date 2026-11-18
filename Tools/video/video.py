@@ -10,26 +10,22 @@ routing when a job crashes repeatedly or exceeds maximum delivery attempts.
 """
 import datetime
 import json
-import os
 import time
 import uuid
 
 import pika
 import pytz
-from pika.exchange_type import ExchangeType
 
 import utils.env as env
 from effects import UnsupportedEffect
 from video_processor import InvalidSpeed, InvalidTrim, InvalidVideo, process_video
 
-EXCHANGE = "picturas"
-DLX_EXCHANGE = "picturas.dlx"
-VIDEO_QUEUE = "video_queue"
-VIDEO_DLQ = "video_dlq"
+from topology import (EXCHANGE, VIDEO_QUEUE, VIDEO_FAILED_EVENTS, MAX_REDELIVERIES,
+                      declare_topology)
+
 PROJECT_QUEUE = "project_queue"
 WS_QUEUE = "ws_queue"
 MICROSERVICE = "picturas-video-tool-ms"
-MAX_REDELIVERIES = 1  # 1 initial attempt + 1 retry = 2 total attempts before DLQ
 
 CODES = {
     "wrong_procedure": 2000,
@@ -49,25 +45,16 @@ def now():
 class VideoWorker:
     def __init__(self):
         self._connection = self._connect()
-        self._channel = self._connection.channel()
-        self._channel.exchange_declare(exchange=EXCHANGE,
-                                       exchange_type=ExchangeType.direct, durable=True)
-        self._channel.exchange_declare(exchange=DLX_EXCHANGE,
-                                       exchange_type=ExchangeType.direct, durable=True)
-        self._channel.queue_declare(queue=VIDEO_DLQ, durable=True)
-        self._channel.queue_bind(queue=VIDEO_DLQ, exchange=DLX_EXCHANGE, routing_key=VIDEO_DLQ)
-
-        self._channel.queue_declare(
-            queue=VIDEO_QUEUE,
-            durable=True,
-            arguments={
-                "x-dead-letter-exchange": DLX_EXCHANGE,
-                "x-dead-letter-routing-key": VIDEO_DLQ,
-            },
-        )
-        self._channel.queue_bind(queue=VIDEO_QUEUE, exchange=EXCHANGE, routing_key=VIDEO_QUEUE)
-        # one video at a time per replica; parallelism comes from replicas
-        self._channel.basic_qos(prefetch_count=1)
+        try:
+            self._channel = self._connection.channel()
+            declare_topology(self._channel)
+            self._channel.confirm_delivery()
+            # One video at a time per replica; parallelism comes from replicas.
+            self._channel.basic_qos(prefetch_count=1)
+        except Exception:
+            if self._connection.is_open:
+                self._connection.close()
+            raise
 
     @staticmethod
     def _connect():
@@ -87,7 +74,11 @@ class VideoWorker:
 
     def _publish(self, queue, msg):
         self._channel.basic_publish(exchange=EXCHANGE, routing_key=queue,
-                                    body=json.dumps(msg))
+                                    body=json.dumps(msg), mandatory=True,
+                                    properties=pika.BasicProperties(
+                                        delivery_mode=2, content_type="application/json",
+                                        message_id=msg.get("messageId"),
+                                    ))
 
     def _reply_success(self, msg_id, started, output_uri, video_info):
         output = {"type": video_info.get("output_type", "video"),
@@ -139,27 +130,45 @@ class VideoWorker:
             "percent": percent,
         })
 
+    @staticmethod
+    def _request(body):
+        info = json.loads(body.decode())
+        if not isinstance(info, dict) or not isinstance(info.get("parameters"), dict):
+            raise ValueError("Expected a video request with parameters")
+        params = info["parameters"]
+        for name, value in (("messageId", info.get("messageId")),
+                            ("inputImageURI", params.get("inputImageURI")),
+                            ("outputImageURI", params.get("outputImageURI"))):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Missing or invalid {name}")
+        tools = params.get("tools", [])
+        if not isinstance(tools, list) or any(
+            not isinstance(tool, dict) or not isinstance(tool.get("procedure"), str)
+            or not isinstance(tool.get("params", {}), dict) for tool in tools
+        ):
+            raise ValueError("Expected a list of tools with procedure and params")
+        if not isinstance(params.get("progress", {}), dict):
+            raise ValueError("Expected progress metadata")
+        return info, params
+
     def callback(self, ch, method, properties, body):
         started = now()
-        info = {}
         try:
-            info = json.loads(body.decode())
-            msg_id = info["messageId"]
-            params = info["parameters"]
-            input_uri = params["inputImageURI"]
-            output_uri = params["outputImageURI"]
-            tools = params.get("tools") or []
-            preview = bool(params.get("preview"))
-            progress = params.get("progress") or {}
-        except (ValueError, KeyError) as e:
+            info, params = self._request(body)
+        except (ValueError, UnicodeError) as e:
             print(f"[video] invalid message routed to DLQ: {e}", flush=True)
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        # Check if message was already redelivered after a worker crash/OOM
-        is_redelivered = bool(getattr(method, "redelivered", False))
-        print(f"[video] msg={msg_id} redelivered={is_redelivered} preview={preview} "
-              f"tools={[t.get('procedure') for t in tools]}", flush=True)
+        msg_id = info["messageId"]
+        input_uri = params["inputImageURI"]
+        output_uri = params["outputImageURI"]
+        tools = params.get("tools", [])
+        preview = bool(params.get("preview"))
+        progress = params.get("progress", {})
+        deliveries = (getattr(properties, "headers", None) or {}).get("x-delivery-count", 0)
+        print(f"[video] msg={msg_id} retry={deliveries}/{MAX_REDELIVERIES} "
+              f"preview={preview} tools={[t['procedure'] for t in tools]}", flush=True)
 
         if info.get("procedure") != "video":
             self._reply_error(msg_id, started, CODES["wrong_procedure"],
@@ -172,12 +181,8 @@ class VideoWorker:
                 input_uri, output_uri, tools, preview=preview,
                 progress_cb=lambda pct: self._progress(progress, preview, pct),
             )
-            self._reply_success(msg_id, started, output_uri, result)
-            print(f"[video] msg={msg_id} ok frames={result['frames']} "
-                  f"t={(now() - started).total_seconds():.1f}s", flush=True)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
         except (UnsupportedEffect, InvalidTrim, InvalidSpeed, InvalidVideo) as e:
-            # Deterministic domain errors: report to user and acknowledge
+            # Deterministic errors need user correction, not retries.
             code_map = {
                 UnsupportedEffect: CODES["unsupported_effect"],
                 InvalidTrim: CODES["invalid_trim"],
@@ -186,26 +191,70 @@ class VideoWorker:
             }
             self._reply_error(msg_id, started, code_map[type(e)], str(e), input_uri)
             ch.basic_ack(delivery_tag=method.delivery_tag)
-        except Exception as e:  # noqa: BLE001
-            print(f"[video] msg={msg_id} error (redelivered={is_redelivered}): {e}", flush=True)
-            if is_redelivered:
-                # Already retried once: isolate in DLQ and notify orchestrator/UI
-                self._reply_error(
-                    msg_id, started, CODES["max_retries_exceeded"],
-                    f"Video processing failed after retry and was moved to DLQ: {e}",
-                    input_uri,
-                )
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-            else:
-                # First unexpected failure: requeue once for another healthy replica
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            return
+        except pika.exceptions.AMQPError:
+            # Reconnect without ack: the broker also counts connection failures.
+            raise
+        except Exception as e:
+            print(f"[video] msg={msg_id} processing failed: {e}", flush=True)
+            # Quorum delivery counts survive consumer crashes/OOM. Unlike a
+            # boolean redelivered flag they enforce a bound across replicas.
+            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=True)
+            return
+
+        # Publication failures escape to the reconnect loop. Never acknowledge a
+        # job until its persistent, mandatory reply has been broker-confirmed.
+        self._reply_success(msg_id, started, output_uri, result)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        print(f"[video] msg={msg_id} ok frames={result['frames']} "
+              f"t={(now() - started).total_seconds():.1f}s", flush=True)
+
+    def failed_callback(self, ch, method, properties, body):
+        """Notify terminal failure without consuming the retained DLQ copy."""
+        try:
+            info, params = self._request(body)
+        except (ValueError, UnicodeError):
+            # A malformed request may not have an ID to correlate. Its original
+            # body stays in the DLQ for inspection, rather than killing workers.
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+        self._reply_error(
+            info["messageId"], now(), CODES["max_retries_exceeded"],
+            "Video processing could not be completed after automatic retries. "
+            "The request has been retained for investigation.",
+            params["inputImageURI"],
+        )
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def run(self):
         self._channel.basic_consume(queue=VIDEO_QUEUE, on_message_callback=self.callback,
                                     auto_ack=False)
-        print("[video] waiting for jobs on video_queue (DLQ enabled)", flush=True)
+        self._channel.basic_consume(queue=VIDEO_FAILED_EVENTS,
+                                    on_message_callback=self.failed_callback, auto_ack=False)
+        print(f"[video] waiting for jobs on {VIDEO_QUEUE} (bounded retries enabled)", flush=True)
         self._channel.start_consuming()
+
+    def close(self):
+        if self._connection.is_open:
+            self._connection.close()
+
+
+def main():
+    while True:
+        worker = None
+        try:
+            worker = VideoWorker()
+            worker.run()
+        except (pika.exceptions.AMQPError, OSError, RuntimeError) as e:
+            print(f"[video] connection unavailable, reconnecting: {e}", flush=True)
+            time.sleep(2)
+        finally:
+            if worker is not None:
+                try:
+                    worker.close()
+                except pika.exceptions.AMQPError:
+                    pass
 
 
 if __name__ == "__main__":
-    VideoWorker().run()
+    main()

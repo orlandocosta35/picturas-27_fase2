@@ -240,6 +240,11 @@ export const useProcessProject = (
         runnerUserId: uid,
       }),
 
+    onError: () => {
+      // A partially dispatched batch can invalidate its run before returning an error.
+      qc.invalidateQueries({ queryKey: projectKey, refetchType: "all" });
+    },
+
     onSuccess: async (result) => {
       // 1) atualizar a versão local (se vier header)
       bumpProjectVersion(qc, projectKey, result.version);

@@ -37,6 +37,7 @@ const projectSchema = new mongoose.Schema({
   tools: { type: [toolSchema], default: [] },
   version: { type: Number, default: 0 },
   activeToken: { type: Number, default: 0 },
+  failedToken: { type: Number, default: -1 },
   resultsToken: { type: Number, default: 0 },
   cancelToken: { type: Number, default: 0 },
   committedToken: { type: Number, default: 0 },

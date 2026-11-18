@@ -36,7 +36,7 @@ function send_msg_tool(msg_id, timestamp, og_img_uri, new_img_uri, tool, params)
         }
     };
 
-    send_rabbit_msg(msg, queue);
+    return send_rabbit_msg(msg, queue);
 }
 
 function send_msg_client(msg_id, timestamp, user) {
@@ -48,7 +48,7 @@ function send_msg_client(msg_id, timestamp, user) {
         "status": 'success'
     };
 
-    send_rabbit_msg(msg, queue);
+    return send_rabbit_msg(msg, queue);
 }
 
 function send_msg_client_error(msg_id, timestamp, user, error_code, error_msg) {
@@ -62,7 +62,7 @@ function send_msg_client_error(msg_id, timestamp, user, error_code, error_msg) {
         "errorMsg": error_msg
     };
 
-    send_rabbit_msg(msg, queue);
+    return send_rabbit_msg(msg, queue);
 }
 
 function send_msg_client_preview(msg_id, timestamp, user, url) {
@@ -75,7 +75,7 @@ function send_msg_client_preview(msg_id, timestamp, user, url) {
         "img_url": url
     };
 
-    send_rabbit_msg(msg, queue);
+    return send_rabbit_msg(msg, queue);
 }
 
 function send_msg_client_preview_error(msg_id, timestamp, user, error_code, error_msg) {
@@ -89,7 +89,7 @@ function send_msg_client_preview_error(msg_id, timestamp, user, error_code, erro
         "errorMsg": error_msg
     };
 
-    send_rabbit_msg(msg, queue);
+    return send_rabbit_msg(msg, queue);
 }
 
 function read_msg(callback){
