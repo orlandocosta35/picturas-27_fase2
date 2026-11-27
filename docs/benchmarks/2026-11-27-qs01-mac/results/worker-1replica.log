@@ -1,0 +1,25 @@
+2026-11-27T21:27:09.499463010Z [video] waiting for jobs on video_queue_v2 (bounded retries enabled)
+2026-11-27T21:27:24.431950628Z [video] msg=bench-r1-a-warmup0-2d1a57f0 retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:27:29.228852380Z [video] msg=bench-r1-a-warmup0-2d1a57f0 ok frames=300 t=4.8s
+2026-11-27T21:27:29.259972547Z [video] msg=bench-r1-a-subtitles-b075ae3b retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:29:16.297325513Z [video] msg=bench-r1-a-subtitles-b075ae3b ok frames=4415 t=107.0s
+2026-11-27T21:29:16.299813763Z [video] msg=bench-r1-a-rotate-7cb9d4ea retry=0/1 preview=False tools=['rotate']
+2026-11-27T21:29:18.772545417Z [video] msg=bench-r1-a-rotate-7cb9d4ea ok frames=300 t=2.5s
+2026-11-27T21:29:18.774190959Z [video] msg=bench-r1-a-saturation-a1697091 retry=0/1 preview=False tools=['saturation']
+2026-11-27T21:29:21.390623877Z [video] msg=bench-r1-a-saturation-a1697091 ok frames=300 t=2.6s
+2026-11-27T21:29:39.680902969Z [video] msg=bench-r1-b-warmup0-f420e3dd retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:29:43.315819054Z [video] msg=bench-r1-b-warmup0-f420e3dd ok frames=300 t=3.6s
+2026-11-27T21:29:43.364650637Z [video] msg=bench-r1-b-subtitles-fb97847f retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:31:28.509192588Z [video] msg=bench-r1-b-subtitles-fb97847f ok frames=4415 t=105.1s
+2026-11-27T21:31:28.511688130Z [video] msg=bench-r1-b-rotate-491c90f7 retry=0/1 preview=False tools=['rotate']
+2026-11-27T21:31:30.971756381Z [video] msg=bench-r1-b-rotate-491c90f7 ok frames=300 t=2.5s
+2026-11-27T21:31:30.973437923Z [video] msg=bench-r1-b-saturation-712c0636 retry=0/1 preview=False tools=['saturation']
+2026-11-27T21:31:33.573316257Z [video] msg=bench-r1-b-saturation-712c0636 ok frames=300 t=2.6s
+2026-11-27T21:31:33.901090133Z [video] msg=bench-r1-c-warmup0-a877362e retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:31:37.404280634Z [video] msg=bench-r1-c-warmup0-a877362e ok frames=300 t=3.5s
+2026-11-27T21:31:37.434123009Z [video] msg=bench-r1-c-subtitles-054e2258 retry=0/1 preview=False tools=['subtitles']
+2026-11-27T21:33:23.383642169Z [video] msg=bench-r1-c-subtitles-054e2258 ok frames=4415 t=105.9s
+2026-11-27T21:33:23.391403169Z [video] msg=bench-r1-c-rotate-8b58a43e retry=0/1 preview=False tools=['rotate']
+2026-11-27T21:33:26.002041254Z [video] msg=bench-r1-c-rotate-8b58a43e ok frames=300 t=2.6s
+2026-11-27T21:33:26.003935504Z [video] msg=bench-r1-c-saturation-4f0668a7 retry=0/1 preview=False tools=['saturation']
+2026-11-27T21:33:28.662184922Z [video] msg=bench-r1-c-saturation-4f0668a7 ok frames=300 t=2.7s
