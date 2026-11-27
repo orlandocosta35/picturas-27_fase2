@@ -1,0 +1,54 @@
+# Campanha experimental local — PictuRAS Fase 2 (2026-11-21)
+# Ambiente: Ubuntu Linux x86_64, 32 GB RAM, 12 núcleos lógicos, Docker Compose (commit 7bf15cd)
+
+## 1. Verificação de migração e topologia de filas
+$ docker compose run --rm --no-deps video_tool python migrate_queue.py --apply --producers-stopped
+Legacy video_queue does not exist; no migration is needed.
+
+$ docker compose exec rabbitmq rabbitmqctl list_queues name type messages_ready messages_unacknowledged consumers
+video_queue_v2       quorum   0  0  0
+video_dlq            classic  0  0  0
+video_failed_events  classic  0  0  0
+
+## 2. Cenário QS-01 — Baseline sequencial (video_tool=1)
+$ docker compose up -d --scale video_tool=1
+$ docker stats --no-stream picturas-video_tool-1
+CONTAINER ID   NAME                    CPU %     MEM USAGE / LIMIT   MEM %     NET I/O         BLOCK I/O      PIDS
+7d16cbea6997   picturas-video_tool-1   202.24%   1.444GiB / 2.5GiB   57.75%    59kB / 96.8kB   134MB / 36MB   129
+
+$ docker compose logs -f --timestamps video_tool
+video_tool-1  | 2026-11-21T15:31:52.685427488Z [video] waiting for jobs on video_queue_v2 (bounded retries enabled)
+video_tool-1  | 2026-11-21T15:36:27.786820710Z [video] msg=request-a8d996d4-ea20-4f56-ba5b-e133d9b9848c retry=0/1 preview=False tools=['subtitles']
+video_tool-1  | 2026-11-21T15:40:08.236610063Z [video] msg=request-a8d996d4-ea20-4f56-ba5b-e133d9b9848c ok frames=4415 t=220.4s
+video_tool-1  | 2026-11-21T15:40:08.255050415Z [video] msg=request-b402b1d5-a093-47d7-b10c-c426cf88ea70 retry=0/1 preview=False tools=['rotate']
+video_tool-1  | 2026-11-21T15:40:17.329891381Z [video] msg=request-b402b1d5-a093-47d7-b10c-c426cf88ea70 ok frames=300 t=9.1s
+video_tool-1  | 2026-11-21T15:40:17.364827016Z [video] msg=request-78566f76-67b5-4e94-a9c6-88ea24b680f5 retry=0/1 preview=False tools=['saturation']
+video_tool-1  | 2026-11-21T15:40:23.133167025Z [video] msg=request-78566f76-67b5-4e94-a9c6-88ea24b680f5 ok frames=300 t=5.8s
+
+## 3. Ensaio de saturação — 3 tarefas simultâneas de legendagem IA (video_tool=3, limite 2.5 GiB)
+video_tool-1  | 2026-11-21T15:45:11.269588766Z [video] msg=request-4bfa80e9-04e3-4509-bd32-878d13423825 retry=0/1 preview=False tools=['subtitles']
+video_tool-1 exited with code 137
+video_tool-3  | 2026-11-21T15:45:51.592009460Z [video] msg=request-c75fe70b-e201-46c2-ab29-f0b99027844a processing failed: [mp4 @ 0x56c6f8fa4880] Unable to re-open /app/images/users/6af9c9a841a74148e143716e/projects/6af9cc4f262a35d59be9681d/out/captions-s2xeznvu/stage-0.mp4.part.mp4 output file for shifting data
+video_tool-3  | 2026-11-21T15:45:51.600801805Z [video] msg=request-4bfa80e9-04e3-4509-bd32-878d13423825 retry=1/1 preview=False tools=['subtitles']
+video_tool-2  | 2026-11-21T15:46:48.748061025Z [video] msg=request-0e5eeadf-bba5-4a19-9752-7628c4878d70 processing failed: [mp4 @ 0x5d3975576880] Unable to re-open /app/images/users/6af9c9a841a74148e143716e/projects/6af9cc4f262a35d59be9681d/out/captions-ld5ngaum/stage-0.mp4.part.mp4 output file for shifting data
+video_tool-2  | 2026-11-21T15:46:48.758739532Z [video] msg=request-c75fe70b-e201-46c2-ab29-f0b99027844a retry=1/1 preview=False tools=['subtitles']
+video_tool-3 exited with code 137
+video_tool-2 exited with code 137
+
+## 4. Cenário QS-02 — Failover após docker kill (SIGKILL) e Poison Message (DLQ)
+$ docker kill picturas-video_tool-1
+$ docker compose logs -f --since 2s --timestamps video_tool
+video_tool-1  | 2026-11-21T15:48:45.554263904Z [video] msg=request-3324cc8a-ebb5-43b2-a077-e65f98795962 retry=0/1 preview=False tools=['rotate']
+video_tool-2  | 2026-11-21T15:48:51.894330374Z [video] msg=request-3324cc8a-ebb5-43b2-a077-e65f98795962 retry=1/1 preview=False tools=['rotate']
+video_tool-1 exited with code 137
+video_tool-2  | 2026-11-21T15:49:01.008240687Z [video] msg=request-3324cc8a-ebb5-43b2-a077-e65f98795962 ok frames=300 t=9.1s
+video_tool-1  | 2026-11-21T15:49:06.398050673Z [video] waiting for jobs on video_queue_v2 (bounded retries enabled)
+video_tool-3  | 2026-11-21T15:49:17.194789389Z [video] invalid message routed to DLQ: Expected a video request with parameters
+
+$ docker compose exec rabbitmq rabbitmqadmin publish exchange=picturas routing_key=video_queue payload='{"invalid_payload": true}'
+Message published
+
+$ docker compose exec rabbitmq rabbitmqctl list_queues name type messages_ready | grep video
+video_queue_v2       quorum   0
+video_dlq            classic  1
+video_failed_events  classic  0
