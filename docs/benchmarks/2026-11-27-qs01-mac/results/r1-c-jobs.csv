@@ -1,0 +1,4 @@
+run,job,msg_id,t_submit,t_confirm,t_reply,latency_s,status,worker_processing_s,frames
+r1-c,subtitles,bench-r1-c-subtitles-054e2258,2026-11-27T21:31:37.428+00:00,2026-11-27T21:31:37.434+00:00,2026-11-27T21:33:23.388+00:00,105.96,success,105.95,4415
+r1-c,rotate,bench-r1-c-rotate-8b58a43e,2026-11-27T21:31:37.434+00:00,2026-11-27T21:31:37.435+00:00,2026-11-27T21:33:26.039+00:00,108.6,success,2.61,300
+r1-c,saturation,bench-r1-c-saturation-4f0668a7,2026-11-27T21:31:37.435+00:00,2026-11-27T21:31:37.436+00:00,2026-11-27T21:33:28.692+00:00,111.26,success,2.66,300
